@@ -1,0 +1,228 @@
+from sre_parse import expand_template
+import h5py
+import numpy as np
+
+filename = "/Users/danielruttenberg/Downloads/QualityQC/data/Micros_001_TenMinClip_NAPS.analysis.h5"
+
+import copy
+import math
+import pandas as pd
+import scipy.ndimage
+from tqdm import tqdm
+from scipy.signal import savgol_filter
+import skvideo.io
+import matplotlib.pyplot as plt
+from base64 import b64encode
+import seaborn as sns
+
+import skvideo
+import skvideo.datasets
+import skvideo.io
+
+def flatten_features(x, axis=0):
+
+    if axis != 0:
+        # Move time axis to the first dim
+        x = np.moveaxis(x, axis, 0)
+
+    # Flatten to 2D.
+    initial_shape = x.shape
+    x = x.reshape(len(x), -1)
+
+    return x, initial_shape
+
+def unflatten_features(x, initial_shape, axis=0):
+    # Reshape.
+    x = x.reshape(initial_shape)
+
+    if axis != 0:
+        # Move time axis back
+        x = np.moveaxis(x, 0, axis)
+
+    return x
+
+def fill_missing(x, kind="nearest", axis=0, **kwargs):
+    """Fill missing values in a timeseries.
+
+    Args:
+        x: Timeseries of shape (time, ...) or with time axis specified by axis.
+        kind: Type of interpolation to use. Defaults to "nearest".
+        axis: Time axis (default: 0).
+
+    Returns:
+        Timeseries of the same shape as the input with NaNs filled in.
+
+    Notes:
+        This uses pandas.DataFrame.interpolate and accepts the same kwargs.
+    """
+    if x.ndim > 2:
+        # Reshape to (time, D)
+        x, initial_shape = flatten_features(x, axis=axis)
+
+        # Interpolate.
+        x = fill_missing(x, kind=kind, axis=0, **kwargs)
+
+        # Restore to original shape
+        x = unflatten_features(x, initial_shape, axis=axis)
+
+        return x
+    return pd.DataFrame(x).interpolate(method=kind, axis=axis, **kwargs).to_numpy()
+
+def get_angle(x, y):
+    angle = math.degrees(math.asin(y / math.hypot(x, y)))
+    if x < 0:
+        angle = 180 - angle
+    elif angle < 0:
+        angle = 360 + angle
+    return(angle)
+
+def rotate_point(x, y, angle):
+    angle = math.radians(angle)
+    new_x = x * math.cos(angle) + y * math.sin(angle)
+    new_y = -x * math.sin(angle) + y * math.cos(angle)
+    return (new_x, new_y)
+
+def instance_node_velocities(fly_node_locations, start_frame, end_frame):
+    frame_count = len(range(start_frame, end_frame))
+    if len(fly_node_locations.shape) == 4:
+        fly_node_velocities = np.zeros(
+            (frame_count, fly_node_locations.shape[1], fly_node_locations.shape[3])
+        )
+        for fly_idx in range(fly_node_locations.shape[3]):
+            for n in tqdm(range(0, fly_node_locations.shape[1])):
+                fly_node_velocities[:, n, fly_idx] = diff(
+                    fly_node_locations[start_frame:end_frame, n, :, fly_idx]
+                )
+    else:
+        fly_node_velocities = np.zeros((frame_count, fly_node_locations.shape[1]))
+        for n in tqdm(range(0, fly_node_locations.shape[1])):
+            fly_node_velocities[:, n] = diff(
+                fly_node_locations[start_frame:end_frame, n, :]
+            )
+
+    return fly_node_velocities
+
+def diff(node_loc, diff_func=np.gradient, **kwargs):
+    """
+    node_loc is a [frames, 2] arrayF
+
+    win defines the window to smooth over
+
+    poly defines the order of the polynomial
+    to fit with
+
+    """
+    node_loc_vel = np.zeros_like(node_loc)
+    for c in range(node_loc.shape[-1]):
+        node_loc_vel[:, c] = diff_func(node_loc[:, c], **kwargs)
+
+    node_vel = np.linalg.norm(node_loc_vel, axis=1)
+
+    return node_vel
+
+def egocentrizedata(locations):
+    transploc = copy.deepcopy(locations)
+    rotloc = copy.deepcopy(locations)
+    egocentloc = copy.deepcopy(locations)
+    #Transpose
+    for i in range(0,locations.shape[0]):
+        for j in range(0,locations.shape[3]):
+            x = locations[i,2,0,j]
+            y = locations[i,2,1,j]
+            for k in range(0,locations.shape[1]):
+                transploc[i,k,0,j] = locations[i,k,0,j] - x
+                transploc[i,k,1,j] = locations[i,k,1,j] - y
+
+
+
+    #Rotate
+    for i in range(0,locations.shape[0]):
+        for j in range(0,locations.shape[3]):
+            x = transploc[i,3,0,j]
+            y = transploc[i,3,1,j]
+            angle = get_angle(x,y)
+            for k in range(0,locations.shape[1]):
+                a,b = rotate_point(transploc[i,k,0,j],transploc[i,k,1,j], angle)
+                rotloc[i,k,0,j] = a
+                rotloc[i,k,1,j] = b
+
+
+    #Standardize
+    for i in range(0,locations.shape[0]):
+        for j in range(0,locations.shape[3]):
+            x = rotloc[i,3,0,j]
+            scale = x/10
+            for k in range(0,locations.shape[1]):
+                egocentloc[i,k,0,j] = rotloc[i,k,0,j] / scale
+                egocentloc[i,k,1,j] = rotloc[i,k,1,j] / scale
+    return(egocentloc)
+
+
+def velfilt(locs, thresh):
+     filledlocs = fill_missing(locs[:,:,:,:], kind="pad")
+     vels = instance_node_velocities(filledlocs, 1, 11751)
+     velsbool = vels > thresh
+     return velsbool
+
+def egofilt(locations, egocentloc, z=2.5):
+    egozscore = copy.deepcopy(locations)
+    for k in range(0,locations.shape[1]):
+        print(k)
+        tags = egocentloc[:, k, :, :]
+        tags = tags.transpose(2,0,1).reshape(-1,tags.shape[1])
+        tags = pd.DataFrame(tags)
+        tags.columns = ['xcoord', 'ycoord']
+        nodemeansx = tags['xcoord'].mean()
+        nodemeansy = tags['ycoord'].mean()
+        nodesdx = tags['xcoord'].std()
+        nodesdy = tags['ycoord'].std()
+        if nodesdx < 1e-15:
+            nodesdx = 1e-15
+        if nodesdy < 1e-15:
+            nodesdy = 1e-15
+        egozscore[:, k, 0, :] = ((egocentloc[:, k, 0, :] - nodemeansx)/nodesdx)
+        egozscore[:, k, 1, :] = ((egocentloc[:, k, 1, :] - nodemeansy)/nodesdy)
+        egozscore[np.isnan(egozscore)] = 20000
+    egobool = egozscore > z
+    return(egobool[:,:,0,:]) 
+
+def interpolatevelsbool(velsbool, limit):
+    mask = velsbool.copy()
+    for i in range(0,velsbool.shape[1]):
+        for j in range(0,velsbool.shape[2]):
+            velsbool_col = velsbool[:,i,j].copy()
+            df = pd.DataFrame(velsbool_col)
+            df['new'] = ((df != df.shift()).cumsum())
+            df['ones'] = 1
+            mask[:,i,j] = (df.groupby('new')['ones'].transform('count') < limit) | velsbool_col
+    return(mask)
+   
+
+def integratedfilter(locations, velsbool, egobool, interpbool):
+    interponlybool = velsbool ^ interpbool
+    egointerpbool = egobool[1:,:,:] & interponlybool
+    finalbool = egointerpbool + velsbool
+    final2dbool = np.stack((finalbool,finalbool), axis=2)
+    locationsfilter = copy.deepcopy(locations)
+    locationsfilter = locationsfilter[1:,:,:,:]
+    locationsfilter[final2dbool] = np.nan
+    return(locationsfilter)
+
+
+with h5py.File(filename, "r") as f:
+    dset_names = list(f.keys())
+    locations = f["tracks"][:].T
+    node_names = [n.decode() for n in f["node_names"][:]]
+    track_names = f["track_names"][:]
+
+
+print("===locations data shape===")
+print(locations.shape)
+print()
+
+egocentloc = egocentrizedata(locations)
+velsbool = velfilt(locations, 2)
+egobool = egofilt(locations, egocentloc, 1.5)
+interpbool = interpolatevelsbool(velsbool, 5)
+locationscut = locations[1:,:,:,:]
+integfilter = integratedfilter(locations, velsbool, egobool, interpbool)
